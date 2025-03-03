@@ -35,6 +35,7 @@ from peft.utils.other import transpose
 
 from .config import LoraConfig
 from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, _DoraConvNdLayer
+import time
 
 
 class LoraLayer(BaseTunerLayer):
@@ -709,7 +710,10 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
+            time_base_layer_start = time.time()
             result = self.base_layer(x, *args, **kwargs)
+            time_base_layer = time.time() - time_base_layer_start
+            print('base layer inference time: ', time_base_layer)
             torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
@@ -721,7 +725,10 @@ class Linear(nn.Module, LoraLayer):
                 x = self._cast_input_dtype(x, lora_A.weight.dtype)
 
                 if not self.use_dora[active_adapter]:
+                    time_lora_layer_start = time.time()
                     result = result + lora_B(lora_A(dropout(x))) * scaling
+                    time_lora_layer = time.time() - time_lora_layer_start
+                    print('lora layer inference time: ', time_lora_layer)
                 else:
                     if isinstance(dropout, nn.Identity) or not self.training:
                         base_result = result
