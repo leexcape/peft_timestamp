@@ -36,7 +36,9 @@ from peft.utils.other import transpose
 from .config import LoraConfig
 from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, _DoraConvNdLayer
 import time
-
+from datetime import datetime
+import matplotlib.pyplot as plt
+from forward_snapshot import log_vit_layer_data
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
@@ -697,6 +699,59 @@ class Linear(nn.Module, LoraLayer):
 
         return output_tensor
 
+    def _benchmark_forward(self, x, runs=500):
+        """Run base_layer and LoRA forward 200 times and record average inference time."""
+        base_times = []
+        lora_times = []
+
+        for _ in range(runs):
+            if _ in range(170, 180):
+                print(torch.cuda.memory_summary())
+            # Base layer timing
+            start_time = time.time()
+            base_out = self.base_layer(x)
+            base_times.append(time.time() - start_time)
+
+            # LoRA layer timing
+            for active_adapter in self.active_adapters:
+                if active_adapter not in self.lora_A.keys():
+                    continue
+                lora_A = self.lora_A[active_adapter]
+                lora_B = self.lora_B[active_adapter]
+                dropout = self.lora_dropout[active_adapter]
+                scaling = self.scaling[active_adapter]
+                # x = self._cast_input_dtype(x, lora_A.weight.dtype)
+                start_time = time.time()
+                lora_out = lora_B(lora_A(x))
+                lora_times.append(time.time() - start_time)
+
+        avg_base_time = sum(base_times) / runs
+        avg_lora_time = sum(lora_times) / (runs * len(self.active_adapters))  # Average across all adapters
+
+        print(f"Average Base Layer Time: {avg_base_time:.6f} sec")
+        print(f"Average LoRA Layer Time: {avg_lora_time:.6f} sec")
+
+        # Plot and save latency graph
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(base_times)), base_times, label="Base Layer Latency", linestyle='-', marker='o',
+                 markersize=2)
+        plt.plot(range(len(lora_times)), lora_times, label="LoRA Layer Latency", linestyle='-', marker='x',
+                 markersize=2)
+        plt.xlabel("Run")
+        plt.ylabel("Latency (sec)")
+        plt.ylim((0, 0.0002))
+        plt.title("Base Layer vs. LoRA Layer Latency per Run")
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plot to a file
+        timestamp = datetime.now().strftime("%Y%m%d_%H_%M_%S_%f")[:-3]
+        filename = "results/latency_test_peft_" + timestamp + ".jpg"
+        plt.savefig(filename)
+        plt.close()
+
+        print(f"Latency plot saved to {filename}")
+
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
@@ -710,10 +765,13 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
+            # self._benchmark_forward(x)
+
             time_base_layer_start = time.time()
             result = self.base_layer(x, *args, **kwargs)
-            time_base_layer = time.time() - time_base_layer_start
-            print('base layer inference time: ', time_base_layer)
+            time_base_layer_end = time.time()
+            log_vit_layer_data(index=0, start_time=time_base_layer_start, end_time=time_base_layer_end, input_tensor=x, output_tensor=result)
+            print('base layer inference time: ', time_base_layer_end - time_base_layer_start)
             torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
@@ -726,9 +784,31 @@ class Linear(nn.Module, LoraLayer):
 
                 if not self.use_dora[active_adapter]:
                     time_lora_layer_start = time.time()
+                    # result = lora_B(lora_A(x))
                     result = result + lora_B(lora_A(dropout(x))) * scaling
-                    time_lora_layer = time.time() - time_lora_layer_start
-                    print('lora layer inference time: ', time_lora_layer)
+                    time_lora_layer_end = time.time()
+                    log_vit_layer_data(index=1, start_time=time_lora_layer_start, end_time=time_lora_layer_end,
+                                       input_tensor=x, output_tensor=result)
+                    print('lora layer inference time: ', time_lora_layer_end - time_lora_layer_start)
+
+                    # base_weight = self.base_layer.weight.detach().cpu()
+                    # base_bias = self.base_layer.bias.detach().cpu()
+                    # lora_A_weight = lora_A.weight.detach().cpu()
+                    # lora_A_bias = lora_A.bias
+                    # lora_B_weight = lora_B.weight.detach().cpu()
+                    # lora_B_bias = lora_B.bias
+                    #
+                    # timestamp = datetime.now().strftime("%Y%m%d_%H_%M_%S_%f")[:-3]
+                    # filename = "data/weights/lora_matrices_" + timestamp + ".pth"
+                    # torch.save({
+                    #     "base_weight": base_weight,
+                    #     "base_bias": base_bias,
+                    #     "lora_A_weight": lora_A_weight,
+                    #     "lora_A_bias": lora_A_bias,
+                    #     "lora_B_weight": lora_B_weight,
+                    #     "lora_B_bias": lora_B_bias,
+                    #     "layer_input": x
+                    # }, filename)
                 else:
                     if isinstance(dropout, nn.Identity) or not self.training:
                         base_result = result
@@ -747,6 +827,7 @@ class Linear(nn.Module, LoraLayer):
 
             result = result.to(torch_result_dtype)
 
+        # self.forward_with_timing(x=x, lora_A=lora_A, lora_B=lora_B)
         return result
 
     def __repr__(self) -> str:
