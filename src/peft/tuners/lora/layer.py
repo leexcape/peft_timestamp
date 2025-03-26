@@ -701,8 +701,19 @@ class Linear(nn.Module, LoraLayer):
 
     def _benchmark_forward(self, x, runs=500):
         """Run base_layer and LoRA forward 200 times and record average inference time."""
+        from collections import defaultdict
+        import json
         base_times = []
         lora_times = []
+        id_record = defaultdict(list)
+        self.eval()
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.lora_A.keys():
+                continue
+            lora_A = self.lora_A[active_adapter]
+            lora_B = self.lora_B[active_adapter]
+            dropout = self.lora_dropout[active_adapter]
+            scaling = self.scaling[active_adapter]
 
         for _ in range(runs):
             if _ in range(170, 180):
@@ -710,20 +721,23 @@ class Linear(nn.Module, LoraLayer):
             # Base layer timing
             start_time = time.time()
             base_out = self.base_layer(x)
-            base_times.append(time.time() - start_time)
+            end_time = time.time()
+            id_record["base" + str(id(self.base_layer))].append(end_time - start_time)
+            # print("id of base layer: ", id(self.base_layer))
+            base_times.append(end_time - start_time)
 
             # LoRA layer timing
-            for active_adapter in self.active_adapters:
-                if active_adapter not in self.lora_A.keys():
-                    continue
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                # x = self._cast_input_dtype(x, lora_A.weight.dtype)
-                start_time = time.time()
-                lora_out = lora_B(lora_A(x))
-                lora_times.append(time.time() - start_time)
+
+            # x = self._cast_input_dtype(x, lora_A.weight.dtype)
+            start_time = time.time()
+            lora_out = lora_B(lora_A(x))
+            end_time = time.time()
+            id_record["lora" + str(id(lora_A))].append(end_time - start_time)
+            # print("id of lora A: ", id(lora_A))
+            # print("id of lora B: ", id(lora_B))
+
+            lora_times.append(end_time - start_time)
+            id_record["input" + str(id(x))].append(x.shape)
 
         avg_base_time = sum(base_times) / runs
         avg_lora_time = sum(lora_times) / (runs * len(self.active_adapters))  # Average across all adapters
@@ -739,7 +753,7 @@ class Linear(nn.Module, LoraLayer):
                  markersize=2)
         plt.xlabel("Run")
         plt.ylabel("Latency (sec)")
-        plt.ylim((0, 0.0002))
+        plt.ylim((0, 0.002))
         plt.title("Base Layer vs. LoRA Layer Latency per Run")
         plt.legend()
         plt.grid(True)
@@ -751,6 +765,11 @@ class Linear(nn.Module, LoraLayer):
         plt.close()
 
         print(f"Latency plot saved to {filename}")
+
+        filename_id = "results/id_record_" + timestamp + ".json"
+        with open(filename_id, "w") as f:
+            json.dump(id_record, f, indent=4) # indent=4 makes it more readable
+
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
@@ -765,7 +784,7 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            # self._benchmark_forward(x)
+            self._benchmark_forward(x)
 
             time_base_layer_start = time.time()
             result = self.base_layer(x, *args, **kwargs)
